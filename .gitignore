@@ -1,0 +1,36 @@
+# Python bytecode, environments and test caches must not enter Git.
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Node dependencies and compiled frontend artifacts are regenerated from manifests.
+node_modules/
+dist/
+coverage/
+
+# Local configuration and credentials are private to each environment.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.aws/
+
+# Terraform state can contain secrets; never commit it.
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+
+# Editor and operating-system generated files are not part of the project.
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs and generated artifacts are not source files.
+*.log
+artifacts/
