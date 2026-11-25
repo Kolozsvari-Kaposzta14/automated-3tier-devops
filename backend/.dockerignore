@@ -1,0 +1,21 @@
+
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.git/
+.env
+.env.*
+tests/
+
+
+# Exclude temporary development backups.
+*.backup
+*.bak
+
+# Exclude test coverage artifacts.
+.coverage
+.coverage.*
+htmlcov/

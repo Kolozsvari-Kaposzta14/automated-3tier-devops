@@ -1,0 +1,23 @@
+# Install all application dependencies first.
+-r requirements.txt
+
+# Pytest executes automated backend tests.
+pytest==8.3.5
+
+# HTTPX provides HTTP client functionality for API testing.
+httpx==0.28.1
+
+# Ruff performs Python linting and code-quality checks.
+ruff==0.11.7
+
+# --------------------------------------------------
+# Test Coverage
+# --------------------------------------------------
+
+# Pytest-cov integrates coverage measurement with Pytest.
+# It identifies application code exercised by our tests.
+pytest-cov==7.1.0
+
+# Coverage is the underlying measurement engine.
+# Pin its version for consistency between local and CI environments.
+coverage==7.17.5

@@ -34,3 +34,20 @@ Thumbs.db
 # Logs and generated artifacts are not source files.
 *.log
 artifacts/
+
+
+# Alternative Python virtual environment directory.
+venv/
+
+# Temporary backup files created during configuration changes.
+*.backup
+*.bak
+
+# Python test coverage reports.
+.coverage
+.coverage.*
+htmlcov/
+
+# Terraform crash logs.
+crash.log
+crash.*.log
