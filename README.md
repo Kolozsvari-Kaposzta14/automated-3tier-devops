@@ -42,7 +42,61 @@ git push -u origin development
 Create `main` as the protected integration branch in GitHub before configuring CI. Later, open pull requests from `development` into `main`. Do not configure mandatory checks until those checks actually exist.
 
 ## Secrets and environment variables
-Copy `.env.example` to `.env` only when we configure Compose. Never commit `.env`, AWS credentials, or tokens. Replace all placeholder credentials with locally generated values.
+Store actual environment files outside the Git repository,
+preferably on the native Linux filesystem when using WSL.
+
+Create a private configuration directory:
+
+```bash
+mkdir -p "$HOME/.config/automated-3tier-devops"
+chmod 700 "$HOME/.config/automated-3tier-devops"
+```
+
+For a fresh installation, create private environment files
+from the corresponding public templates:
+
+```bash
+cp -n .env.example \
+    "$HOME/.config/automated-3tier-devops/primary.env"
+
+cp -n infrastructure/compose/.env.example \
+    "$HOME/.config/automated-3tier-devops/legacy.env"
+
+chmod 600 "$HOME/.config/automated-3tier-devops/primary.env"
+chmod 600 "$HOME/.config/automated-3tier-devops/legacy.env"
+```
+
+Replace placeholder passwords with strong, unique,
+locally generated values before starting the environments.
+
+Use URL-safe characters for the primary PostgreSQL password
+because it is interpolated into the backend database URL.
+
+Do not overwrite existing credentials or change passwords for
+initialized PostgreSQL volumes without coordinating password rotation.
+
+Start the primary three-tier application:
+
+```bash
+env -u POSTGRES_PASSWORD docker compose \
+    --env-file "$HOME/.config/automated-3tier-devops/primary.env" \
+    up -d --build
+```
+
+If the optional standalone PostgreSQL environment is needed,
+start it separately:
+
+```bash
+env -u LEGACY_POSTGRES_PASSWORD docker compose \
+    --project-name compose \
+    --env-file "$HOME/.config/automated-3tier-devops/legacy.env" \
+    -f infrastructure/compose/compose.database.yml \
+    up -d
+```
+
+Never commit actual environment files, database passwords,
+AWS credentials, or authentication tokens.
+
 
 ## Directory map
 - `frontend/`: React + TypeScript application (Phase 2)

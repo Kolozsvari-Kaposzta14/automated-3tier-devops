@@ -1,0 +1,298 @@
+# Continuous Integration workflow for the three-tier application.
+#
+# Responsibilities:
+#   1. Validate backend code quality and automated tests.
+#   2. Validate frontend code quality and automated tests.
+#   3. Verify that all application Docker images can be built.
+#   4. Notify developers when pull request validation fails.
+#
+# This workflow does not deploy the application or publish images.
+
+name: Continuous Integration
+
+# Define the events that trigger this workflow.
+on:
+  # Validate pull requests targeting the main branch.
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+
+  # Validate development branch changes before opening a PR.
+  push:
+    branches:
+      - development
+
+  # Allow manual execution from the GitHub Actions interface.
+  workflow_dispatch:
+
+# Apply least-privilege permissions by default.
+# Individual jobs can request additional permissions if required.
+permissions:
+  contents: read
+
+# Cancel obsolete workflow runs when newer changes are submitted
+# to the same branch or pull request.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # ============================================================
+  # JOB 1: BACKEND VALIDATION
+  # ============================================================
+  backend:
+    name: Backend CI
+
+    # Use a clean GitHub-hosted Linux environment.
+    runs-on: ubuntu-latest
+
+    # Prevent unexpectedly long-running jobs.
+    timeout-minutes: 15
+
+    # Execute shell commands inside the backend directory.
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      # Download the repository into the runner workspace.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Install the Python version used by our application.
+      # Cache pip downloads to accelerate subsequent CI runs.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+
+      # Display runtime information for troubleshooting.
+      - name: Verify Python version
+        run: python --version
+
+      # Install runtime and development dependencies.
+      # requirements-dev.txt includes requirements.txt.
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+
+      # Verify that installed dependencies are compatible.
+      - name: Check dependency integrity
+        run: python -m pip check
+
+      # Reject Python code that violates linting rules.
+      - name: Run Ruff linting
+        run: python -m ruff check .
+
+      # Execute backend tests and enforce minimum code coverage.
+      # Pytest returns a non-zero exit code if a test fails
+      # or coverage falls below the required threshold.
+      - name: Run backend tests and coverage
+        run: |
+          python -m pytest \
+            --cov=app \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            --cov-fail-under=90 \
+            -q
+
+      # Preserve the coverage report for later inspection.
+      - name: Upload backend coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-coverage
+          path: backend/coverage.xml
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ============================================================
+  # JOB 2: FRONTEND VALIDATION
+  # ============================================================
+  frontend:
+    name: Frontend CI
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 15
+
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      # Download the repository into a separate runner.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Install Node.js and enable npm dependency caching.
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # Record runtime versions in the workflow logs.
+      - name: Verify Node.js and npm versions
+        run: |
+          node --version
+          npm --version
+
+      # Install dependencies exactly as defined by the lockfile.
+      # npm ci fails if package.json and package-lock.json disagree.
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # Validate frontend source code.
+      - name: Run frontend linting
+        run: npm run lint
+
+      # Execute automated React component tests.
+      - name: Run frontend tests
+        run: npm test
+
+      # Validate TypeScript compilation and production bundling.
+      - name: Build frontend
+        run: npm run build
+
+      # Preserve the production build as a CI artifact.
+      - name: Upload frontend build
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-build
+          path: frontend/dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  # ============================================================
+  # JOB 3: DOCKER BUILD VALIDATION
+  # ============================================================
+  docker:
+    name: Docker Build CI
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 20
+
+    # Only build Docker images after both application jobs pass.
+    needs:
+      - backend
+      - frontend
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Configure Docker Buildx for container image builds.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Build the backend image without publishing it.
+      - name: Build backend Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: false
+          tags: automated-3tier-backend:ci
+
+      # Build the frontend image without publishing it.
+      - name: Build frontend Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: false
+          tags: automated-3tier-frontend:ci
+
+      # Validate the custom Nginx reverse proxy image.
+      - name: Build Nginx Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./nginx
+          file: ./nginx/Dockerfile
+          push: false
+          tags: automated-3tier-nginx:ci
+
+  # ============================================================
+  # JOB 4: PULL REQUEST FAILURE NOTIFICATION
+  # ============================================================
+  notify-failure:
+    name: PR Failure Notification
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 5
+
+    # Evaluate the results of all validation jobs.
+    needs:
+      - backend
+      - frontend
+      - docker
+
+    # Run only when a validation job fails on a same-repository PR.
+    # Fork PRs generally receive read-only GitHub tokens.
+    if: >-
+      ${{
+        always() &&
+        github.event_name == 'pull_request' &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        (
+          needs.backend.result == 'failure' ||
+          needs.frontend.result == 'failure' ||
+          needs.docker.result == 'failure'
+        )
+      }}
+
+    # Grant comment-writing permission only to this job.
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      # Use the GitHub API to post validation results to the PR.
+      # No application source code is executed in this job.
+      - name: Comment on failed pull request
+        uses: actions/github-script@v7
+        env:
+          BACKEND_RESULT: ${{ needs.backend.result }}
+          FRONTEND_RESULT: ${{ needs.frontend.result }}
+          DOCKER_RESULT: ${{ needs.docker.result }}
+        with:
+          script: |
+            const runUrl =
+              `${context.serverUrl}/${context.repo.owner}/` +
+              `${context.repo.repo}/actions/runs/${context.runId}`;
+
+            const body = [
+              '## Continuous Integration failed',
+              '',
+              '| Validation job | Result |',
+              '|---|---|',
+              `| Backend CI | ${process.env.BACKEND_RESULT} |`,
+              `| Frontend CI | ${process.env.FRONTEND_RESULT} |`,
+              `| Docker Build CI | ${process.env.DOCKER_RESULT} |`,
+              '',
+              'Please review the workflow logs and correct the errors.',
+              '',
+              `[View workflow execution](${runUrl})`
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });

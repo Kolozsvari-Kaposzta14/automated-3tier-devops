@@ -1,0 +1,15 @@
+# FastAPI provides our REST API framework.
+fastapi==0.115.12
+
+# Uvicorn runs the FastAPI application.
+uvicorn==0.34.2
+
+# SQLAlchemy manages database connections and ORM operations.
+sqlalchemy==2.0.40
+
+# PostgreSQL driver with bundled native libraries.
+# Use a newer version with Python 3.14 binary distributions.
+psycopg[binary]==3.3.9
+
+# Pydantic Settings loads database configuration.
+pydantic-settings==2.8.1

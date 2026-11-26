@@ -1,0 +1,36 @@
+# Standalone PostgreSQL environment for local development.
+#
+# This environment is independent of the primary three-tier
+# application and must use its own database credentials.
+
+services:
+  database:
+    image: postgres:16-alpine
+    restart: unless-stopped
+
+    environment:
+      # Database name and username are configuration values.
+      POSTGRES_DB: tasks
+      POSTGRES_USER: tasks_app
+
+      # Require a private password at runtime.
+      # Docker Compose aborts if the variable is missing or empty.
+      POSTGRES_PASSWORD: ${LEGACY_POSTGRES_PASSWORD:?Set LEGACY_POSTGRES_PASSWORD}
+
+    ports:
+      # Restrict database access to the local host.
+      - "127.0.0.1:5432:5432"
+
+    volumes:
+      # Preserve existing database data across container recreation.
+      - tasks_pgdata:/var/lib/postgresql/data
+
+    healthcheck:
+      # Verify that PostgreSQL is ready to accept connections.
+      test: ["CMD-SHELL", "pg_isready -U tasks_app -d tasks"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  tasks_pgdata:

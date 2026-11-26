@@ -1,0 +1,161 @@
+
+# ==========================================================
+# THREE-TIER APPLICATION — DOCKER COMPOSE CONFIGURATION
+# ==========================================================
+#
+# Architecture:
+#   Tier 1: React frontend
+#   Tier 2: FastAPI backend
+#   Tier 3: PostgreSQL database
+#
+# Nginx acts as the reverse proxy and provides a single
+# entry point for the entire application.
+# ==========================================================
+
+# A dedicated Compose project keeps our resources separate
+# from other Docker containers on the machine.
+name: automated-3tier
+
+services:
+
+  # ========================================================
+  # TIER 3 — POSTGRESQL DATABASE
+  # ========================================================
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+
+    # Database credentials and initialization settings.
+    # The password is loaded from our local .env file.
+    environment:
+      POSTGRES_DB: taskmanager
+      POSTGRES_USER: taskapp
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+
+    # Persist database data independently of the container.
+    # Recreating the container will not delete this volume.
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    # Verify that PostgreSQL is ready to accept connections.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taskapp -d taskmanager"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+    # Connect PostgreSQL to the internal application network.
+    networks:
+      - app_network
+
+  # ========================================================
+  # TIER 2 — FASTAPI BACKEND
+  # ========================================================
+
+  backend:
+    # Build the backend image using its dedicated Dockerfile.
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+
+    image: automated-3tier-backend:phase3
+    restart: unless-stopped
+
+    # Connect the backend to PostgreSQL using the Compose
+    # service name "db" as the database hostname.
+    environment:
+      DATABASE_URL: postgresql+psycopg://taskapp:${POSTGRES_PASSWORD}@db:5432/taskmanager
+
+    # Wait until PostgreSQL passes its health check before
+    # starting the backend application.
+    depends_on:
+      db:
+        condition: service_healthy
+
+    # Document the internal API port.
+    # No host port is published because clients access
+    # the backend through the Nginx reverse proxy.
+    expose:
+      - "8000"
+
+    networks:
+      - app_network
+
+  # ========================================================
+  # TIER 1 — REACT FRONTEND
+  # ========================================================
+
+  frontend:
+    # Build the production frontend image.
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+
+    image: automated-3tier-frontend:phase3
+    restart: unless-stopped
+
+    # Document the internal frontend HTTP port.
+    # External requests are routed through Nginx.
+    expose:
+      - "80"
+
+    networks:
+      - app_network
+
+  # ========================================================
+  # NGINX — REVERSE PROXY
+  # ========================================================
+
+  nginx:
+    # Build a custom Nginx image containing our reverse
+    # proxy configuration.
+    #
+    # The configuration is copied into the image at build
+    # time instead of being mounted from the host filesystem.
+    #
+    # This eliminates the runtime bind-mount dependency
+    # that caused our Docker Desktop / WSL startup incident.
+    build:
+      context: ./nginx
+      dockerfile: Dockerfile
+
+    # Assign an identifiable name and tag to the custom image.
+    image: automated-3tier-nginx:phase3
+
+    # Restart automatically after unexpected failures,
+    # unless the container was explicitly stopped.
+    restart: unless-stopped
+
+    # Publish the reverse proxy on localhost port 8080.
+    # Binding to 127.0.0.1 prevents external network access.
+    ports:
+      - "127.0.0.1:8080:80"
+
+    # Start the frontend and backend before Nginx.
+    # This defines startup order, not application readiness.
+    depends_on:
+      - frontend
+      - backend
+
+    # Connect Nginx to the same internal network so it
+    # can resolve and communicate with both application tiers.
+    networks:
+      - app_network
+
+# ==========================================================
+# PERSISTENT STORAGE
+# ==========================================================
+
+volumes:
+  # Named Docker volume for persistent PostgreSQL data.
+  postgres_data:
+
+# ==========================================================
+# APPLICATION NETWORKING
+# ==========================================================
+
+networks:
+  # Dedicated bridge network for service communication.
+  app_network:
+    driver: bridge
