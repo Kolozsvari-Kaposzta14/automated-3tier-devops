@@ -1,0 +1,419 @@
+# Continuous Deployment workflow for the three-tier application.
+#
+# Initial responsibilities:
+#   1. Generate a unique immutable release identifier.
+#   2. Authenticate to AWS using GitHub OIDC.
+#   3. Build and publish the three application images.
+#   4. Verify published image digests against AWS ECR.
+#   5. Generate a machine-readable release manifest.
+#
+# Staging and production deployment jobs will be added
+# after secure local deployment infrastructure is prepared.
+
+name: Continuous Deployment
+
+on:
+  # Automatically publish releases after integration into main.
+  push:
+    branches:
+      - main
+
+  # Allow controlled manual execution from GitHub Actions.
+  workflow_dispatch:
+
+# Deny permissions unless explicitly requested by a job.
+permissions: {}
+
+# Prevent simultaneous publishing runs.
+# Do not interrupt a release that is already publishing.
+concurrency:
+  group: cd-publishing
+  cancel-in-progress: false
+
+# Repository variables contain non-secret AWS configuration.
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+  ECR_BACKEND_REPOSITORY: ${{ vars.ECR_BACKEND_REPOSITORY }}
+  ECR_FRONTEND_REPOSITORY: ${{ vars.ECR_FRONTEND_REPOSITORY }}
+  ECR_NGINX_REPOSITORY: ${{ vars.ECR_NGINX_REPOSITORY }}
+  AWS_PAGER: ""
+
+jobs:
+
+  # ============================================================
+  # JOB 1: BUILD, PUBLISH AND VERIFY APPLICATION IMAGES
+  # ============================================================
+  publish:
+    name: Build and Publish Release
+
+    # Manual executions must also originate from main.
+    if: github.ref == 'refs/heads/main'
+
+    # Publishing never executes on the local deployment machine.
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 30
+
+    permissions:
+      # Required to download repository source code.
+      contents: read
+
+      # Required to request a GitHub OIDC identity token.
+      id-token: write
+
+    # Future deployment jobs will consume these outputs.
+    # They must not independently reconstruct release tags.
+    outputs:
+      release_tag: ${{ steps.release.outputs.tag }}
+      registry: ${{ steps.release.outputs.registry }}
+      backend_digest: ${{ steps.verify.outputs.backend_digest }}
+      frontend_digest: ${{ steps.verify.outputs.frontend_digest }}
+      nginx_digest: ${{ steps.verify.outputs.nginx_digest }}
+      manifest_name: ${{ steps.release.outputs.manifest_name }}
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+
+      # --------------------------------------------------------
+      # STEP 1: Retrieve the exact source revision.
+      # --------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Prevent later commands from inheriting Git credentials.
+          persist-credentials: false
+
+      # --------------------------------------------------------
+      # STEP 2: Validate configuration and initialize the release.
+      # --------------------------------------------------------
+      - name: Initialize release metadata
+        id: release
+        run: |
+          set -Eeuo pipefail
+
+          # Validate the repository variables before using them.
+          if [[ ! "$AWS_ACCOUNT_ID" =~ ^[0-9]{12}$ ]]; then
+            echo "FAIL: Invalid AWS account ID."
+            exit 1
+          fi
+
+          if [[ "$AWS_REGION" != "eu-central-1" ]]; then
+            echo "FAIL: Unexpected AWS region."
+            exit 1
+          fi
+
+          # Ensure the workflow targets only our intended repositories.
+          if [[ "$ECR_BACKEND_REPOSITORY" != "three-tier-backend" ||
+                "$ECR_FRONTEND_REPOSITORY" != "three-tier-frontend" ||
+                "$ECR_NGINX_REPOSITORY" != "three-tier-nginx" ]]; then
+            echo "FAIL: Unexpected ECR repository configuration."
+            exit 1
+          fi
+
+          # Confirm that checkout retrieved the triggering revision.
+          if [[ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]]; then
+            echo "FAIL: Checkout revision mismatch."
+            exit 1
+          fi
+
+          # Twelve commit characters provide convenient traceability.
+          # Run ID and attempt distinguish separate publishing attempts.
+          SHORT_SHA="${GITHUB_SHA:0:12}"
+          RELEASE_TAG="sha-${SHORT_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+          MANIFEST_NAME="release-manifest-${RELEASE_TAG}"
+
+          # Expose release information to later workflow steps.
+          {
+            echo "tag=$RELEASE_TAG"
+            echo "registry=$REGISTRY"
+            echo "manifest_name=$MANIFEST_NAME"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Commit: $GITHUB_SHA"
+          echo "Release tag: $RELEASE_TAG"
+          echo "Registry: $REGISTRY"
+          echo "PASS: Release metadata initialized."
+
+      # --------------------------------------------------------
+      # STEP 3: Prepare Docker Buildx.
+      # --------------------------------------------------------
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      # --------------------------------------------------------
+      # STEP 4: Obtain temporary AWS credentials through OIDC.
+      # --------------------------------------------------------
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ECR_PUBLISHER_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: cd-publisher-${{ github.run_id }}
+          role-duration-seconds: 1800
+          allowed-account-ids: ${{ vars.AWS_ACCOUNT_ID }}
+
+      # --------------------------------------------------------
+      # STEP 5: Verify the assumed AWS identity.
+      # --------------------------------------------------------
+      - name: Verify AWS publisher identity
+        run: |
+          set -Eeuo pipefail
+
+          ACTUAL_ARN="$(aws sts get-caller-identity \
+            --query Arn \
+            --output text)"
+
+          EXPECTED_ARN="arn:aws:sts::${AWS_ACCOUNT_ID}:assumed-role/GitHubActions-ECR-Publisher/cd-publisher-${GITHUB_RUN_ID}"
+
+          if [[ "$ACTUAL_ARN" != "$EXPECTED_ARN" ]]; then
+            echo "FAIL: Unexpected AWS identity."
+            exit 1
+          fi
+
+          echo "PASS: Expected AWS publisher role verified."
+
+      # --------------------------------------------------------
+      # STEP 6: Authenticate Docker to the private ECR registry.
+      # --------------------------------------------------------
+      - name: Authenticate Docker to ECR
+        env:
+          REGISTRY: ${{ steps.release.outputs.registry }}
+        run: |
+          set -Eeuo pipefail
+
+          # Pass the ECR password directly through standard input.
+          # Never print the password or store it as a workflow output.
+          aws ecr get-login-password \
+            --region "$AWS_REGION" |
+            docker login \
+              --username AWS \
+              --password-stdin "$REGISTRY"
+
+          echo "PASS: Docker authenticated to ECR."
+
+      # --------------------------------------------------------
+      # STEP 7: Build and publish the backend image.
+      # --------------------------------------------------------
+      - name: Build and publish backend
+        id: backend
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.release.outputs.registry }}/${{ env.ECR_BACKEND_REPOSITORY }}:${{ steps.release.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.release.outputs.tag }}
+
+      # --------------------------------------------------------
+      # STEP 8: Build and publish the frontend image.
+      # --------------------------------------------------------
+      - name: Build and publish frontend
+        id: frontend
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.release.outputs.registry }}/${{ env.ECR_FRONTEND_REPOSITORY }}:${{ steps.release.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.release.outputs.tag }}
+
+      # --------------------------------------------------------
+      # STEP 9: Build and publish the reverse proxy image.
+      # --------------------------------------------------------
+      - name: Build and publish Nginx
+        id: nginx
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ./nginx
+          file: ./nginx/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.release.outputs.registry }}/${{ env.ECR_NGINX_REPOSITORY }}:${{ steps.release.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.release.outputs.tag }}
+
+      # --------------------------------------------------------
+      # STEP 10: Verify registry digests.
+      # --------------------------------------------------------
+      - name: Verify published image digests
+        id: verify
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          BACKEND_DIGEST: ${{ steps.backend.outputs.digest }}
+          FRONTEND_DIGEST: ${{ steps.frontend.outputs.digest }}
+          NGINX_DIGEST: ${{ steps.nginx.outputs.digest }}
+        run: |
+          set -Eeuo pipefail
+
+          verify_image() {
+            local COMPONENT="$1"
+            local REPOSITORY="$2"
+            local EXPECTED="$3"
+            local ACTUAL
+
+            # Validate the digest returned by Docker Buildx.
+            if [[ ! "$EXPECTED" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+              echo "FAIL: Invalid digest for $COMPONENT."
+              exit 1
+            fi
+
+            # Independently retrieve the digest associated with
+            # the immutable release tag from AWS ECR.
+            ACTUAL="$(aws ecr describe-images \
+              --region "$AWS_REGION" \
+              --repository-name "$REPOSITORY" \
+              --image-ids "imageTag=$RELEASE_TAG" \
+              --query 'imageDetails[0].imageDigest' \
+              --output text)"
+
+            if [[ "$ACTUAL" != "$EXPECTED" ]]; then
+              echo "FAIL: Registry digest mismatch for $COMPONENT."
+              exit 1
+            fi
+
+            echo "${COMPONENT}_digest=$ACTUAL" >> "$GITHUB_OUTPUT"
+
+            echo "PASS: $COMPONENT digest verified."
+            echo "$REPOSITORY@$ACTUAL"
+          }
+
+          verify_image backend \
+            "$ECR_BACKEND_REPOSITORY" "$BACKEND_DIGEST"
+
+          verify_image frontend \
+            "$ECR_FRONTEND_REPOSITORY" "$FRONTEND_DIGEST"
+
+          verify_image nginx \
+            "$ECR_NGINX_REPOSITORY" "$NGINX_DIGEST"
+
+          echo "PASS: All three ECR image digests verified."
+
+      # --------------------------------------------------------
+      # STEP 11: Generate the release manifest.
+      # --------------------------------------------------------
+      - name: Generate release manifest
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          REGISTRY: ${{ steps.release.outputs.registry }}
+          BACKEND_DIGEST: ${{ steps.verify.outputs.backend_digest }}
+          FRONTEND_DIGEST: ${{ steps.verify.outputs.frontend_digest }}
+          NGINX_DIGEST: ${{ steps.verify.outputs.nginx_digest }}
+        run: |
+          set -Eeuo pipefail
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          # Construct digest-based image references.
+          # Deployment must use these references rather than
+          # rebuilding application images.
+          images = {}
+
+          for component in ("backend", "frontend", "nginx"):
+              prefix = component.upper()
+
+              repository = os.environ[
+                  f"ECR_{prefix}_REPOSITORY"
+              ]
+
+              digest = os.environ[f"{prefix}_DIGEST"]
+              registry = os.environ["REGISTRY"]
+
+              images[component] = {
+                  "repository": repository,
+                  "digest": digest,
+                  "reference": f"{registry}/{repository}@{digest}",
+              }
+
+          # Record the source revision and publishing attempt.
+          manifest = {
+              "schema_version": 1,
+              "commit_sha": os.environ["GITHUB_SHA"],
+              "release_tag": os.environ["RELEASE_TAG"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "platform": "linux/amd64",
+              "registry": os.environ["REGISTRY"],
+              "images": images,
+          }
+
+          destination = Path("release-manifest.json")
+
+          destination.write_text(
+              json.dumps(manifest, indent=2) + "\n",
+              encoding="utf-8",
+          )
+
+          print(destination.read_text(encoding="utf-8"))
+          print("PASS: Release manifest generated.")
+          PY
+
+      # --------------------------------------------------------
+      # STEP 12: Preserve the verified release metadata.
+      # --------------------------------------------------------
+      - name: Upload release manifest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.release.outputs.manifest_name }}
+          path: release-manifest.json
+          if-no-files-found: error
+          retention-days: 30
+
+      # --------------------------------------------------------
+      # STEP 13: Produce a human-readable workflow summary.
+      # --------------------------------------------------------
+      - name: Write release summary
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          BACKEND_DIGEST: ${{ steps.verify.outputs.backend_digest }}
+          FRONTEND_DIGEST: ${{ steps.verify.outputs.frontend_digest }}
+          NGINX_DIGEST: ${{ steps.verify.outputs.nginx_digest }}
+        run: |
+          set -Eeuo pipefail
+
+          {
+            echo "## Application release published"
+            echo
+            echo "- Commit: $GITHUB_SHA"
+            echo "- Release: $RELEASE_TAG"
+            echo "- Platform: linux/amd64"
+            echo
+            echo "| Component | Verified digest |"
+            echo "|---|---|"
+            echo "| Backend | $BACKEND_DIGEST |"
+            echo "| Frontend | $FRONTEND_DIGEST |"
+            echo "| Nginx | $NGINX_DIGEST |"
+            echo
+            echo "Release manifest uploaded successfully."
+            echo
+            echo "Deployment is not enabled in this workflow revision."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # --------------------------------------------------------
+      # STEP 14: Remove Docker registry authentication.
+      # --------------------------------------------------------
+      - name: Logout from ECR
+        if: ${{ always() && steps.release.outputs.registry != '' }}
+        env:
+          REGISTRY: ${{ steps.release.outputs.registry }}
+        run: |
+          docker logout "$REGISTRY"
