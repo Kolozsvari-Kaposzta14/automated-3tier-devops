@@ -1,0 +1,11 @@
+# =========================================================
+# Nginx Docker build context allowlist
+# =========================================================
+
+# Exclude everything by default.
+**
+
+# Include only the files required for the proxy build.
+!Dockerfile
+!default.conf
+!.dockerignore
