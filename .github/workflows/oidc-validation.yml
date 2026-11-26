@@ -1,0 +1,332 @@
+# =========================================================
+# GitHub Actions — AWS OIDC Validation
+# =========================================================
+#
+# Purpose:
+# Validate GitHub-issued OIDC identity claims, AWS role
+# assumption and repository-scoped ECR access.
+#
+# No images are published and no containers are deployed.
+# =========================================================
+
+name: AWS OIDC Validation
+
+on:
+  workflow_dispatch:
+
+# Deny GitHub token permissions by default.
+permissions: {}
+
+concurrency:
+  group: aws-oidc-validation
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+  ECR_BACKEND_REPOSITORY: ${{ vars.ECR_BACKEND_REPOSITORY }}
+  ECR_FRONTEND_REPOSITORY: ${{ vars.ECR_FRONTEND_REPOSITORY }}
+  ECR_NGINX_REPOSITORY: ${{ vars.ECR_NGINX_REPOSITORY }}
+  AWS_PAGER: ""
+
+jobs:
+
+  # =======================================================
+  # JOB 1 — PUBLISHER AUTHENTICATION
+  # =======================================================
+
+  publisher-oidc:
+    name: Publisher OIDC Authentication
+
+    if: github.ref == 'refs/heads/main'
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      id-token: write
+
+    env:
+      EXPECTED_CONTEXT: ref:refs/heads/main
+      EXPECTED_ENVIRONMENT: ""
+      EXPECTED_ROLE: GitHubActions-ECR-Publisher
+      SESSION_NAME: oidc-publisher-${{ github.run_id }}
+
+    steps:
+
+      # Reusable diagnostic step.
+      # Inspect selected claims without printing the JWT.
+      - &validate-claims
+        name: Validate GitHub OIDC identity claims
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PYTHON'
+          import base64
+          import json
+          import os
+          import sys
+          import urllib.parse
+          import urllib.request
+
+          # Expected immutable GitHub identities.
+          repository = (
+              "Kolozsvari-Kaposzta14/"
+              "automated-3tier-devops"
+          )
+          owner_id = "243810014"
+          repository_id = "1461631005"
+
+          expected_subject = (
+              "repo:Kolozsvari-Kaposzta14@243810014/"
+              "automated-3tier-devops@1461631005:"
+              + os.environ["EXPECTED_CONTEXT"]
+          )
+
+          # Request a token intended specifically for AWS STS.
+          request_url = os.environ[
+              "ACTIONS_ID_TOKEN_REQUEST_URL"
+          ]
+
+          separator = "&" if "?" in request_url else "?"
+
+          request_url += separator + urllib.parse.urlencode(
+              {"audience": "sts.amazonaws.com"}
+          )
+
+          request = urllib.request.Request(
+              request_url,
+              headers={
+                  "Authorization": "Bearer " + os.environ[
+                      "ACTIONS_ID_TOKEN_REQUEST_TOKEN"
+                  ]
+              },
+          )
+
+          # Keep the raw token in process memory only.
+          try:
+              with urllib.request.urlopen(
+                  request, timeout=30
+              ) as response:
+                  token = json.load(response)["value"]
+
+              # Decode the JWT payload for diagnostics.
+              # AWS STS performs signature validation later.
+              payload = token.split(".")[1]
+              payload += "=" * (-len(payload) % 4)
+
+              claims = json.loads(
+                  base64.urlsafe_b64decode(payload)
+              )
+
+          except Exception:
+              print("FAIL: Unable to retrieve or decode OIDC token.")
+              sys.exit(1)
+
+          # Print only explicitly selected identity claims.
+          safe_claims = (
+              "iss",
+              "aud",
+              "sub",
+              "repository",
+              "repository_id",
+              "repository_owner_id",
+              "ref",
+              "environment",
+          )
+
+          print("=== Observed OIDC identity claims ===")
+
+          for key in safe_claims:
+              print(f"{key}: {claims.get(key, '<absent>')}")
+
+          # Verify the identity expected by our IAM trust policy.
+          expected = {
+              "iss": "https://token.actions.githubusercontent.com",
+              "aud": "sts.amazonaws.com",
+              "sub": expected_subject,
+              "repository": repository,
+              "repository_id": repository_id,
+              "repository_owner_id": owner_id,
+              "ref": "refs/heads/main",
+          }
+
+          environment = os.environ["EXPECTED_ENVIRONMENT"]
+
+          if environment:
+              expected["environment"] = environment
+
+          failures = []
+
+          for key, value in expected.items():
+              actual = claims.get(key)
+
+              if actual != value:
+                  failures.append(key)
+                  print(
+                      f"FAIL: {key}: "
+                      f"expected={value!r}, actual={actual!r}"
+                  )
+              else:
+                  print(f"PASS: {key}")
+
+          # The publisher must not have an environment context.
+          if not environment and claims.get("environment"):
+              failures.append("environment")
+              print("FAIL: Unexpected publisher environment.")
+
+          if failures:
+              print("FAIL: OIDC identity claim validation.")
+              sys.exit(1)
+
+          print("PASS: OIDC identity claims match expectations.")
+          PYTHON
+
+      # Obtain temporary AWS credentials through OIDC.
+      - name: Obtain temporary publisher credentials
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ECR_PUBLISHER_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: ${{ env.SESSION_NAME }}
+          role-duration-seconds: 900
+          allowed-account-ids: ${{ vars.AWS_ACCOUNT_ID }}
+
+      # Reusable AWS identity and ECR verification step.
+      - &verify-aws
+        name: Verify AWS identity and ECR access
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ACTUAL_ARN="$(
+            aws sts get-caller-identity \
+              --query Arn \
+              --output text
+          )"
+
+          EXPECTED_ARN="arn:aws:sts::${AWS_ACCOUNT_ID}:assumed-role/${EXPECTED_ROLE}/${SESSION_NAME}"
+
+          echo "Authenticated identity: $ACTUAL_ARN"
+
+          if [ "$ACTUAL_ARN" != "$EXPECTED_ARN" ]; then
+            echo "FAIL: Unexpected AWS role identity."
+            echo "Expected: $EXPECTED_ARN"
+            exit 1
+          fi
+
+          echo "PASS: Expected AWS IAM role assumed."
+
+          # Obtain an ECR authorization token.
+          # Never print or persist the token.
+          aws ecr get-login-password \
+            --region "$AWS_REGION" \
+            > /dev/null
+
+          echo "PASS: ECR authentication."
+
+          # Verify access to all three intended repositories.
+          for REPOSITORY in \
+            "$ECR_BACKEND_REPOSITORY" \
+            "$ECR_FRONTEND_REPOSITORY" \
+            "$ECR_NGINX_REPOSITORY"
+          do
+            aws ecr describe-images \
+              --region "$AWS_REGION" \
+              --repository-name "$REPOSITORY" \
+              --query 'length(imageDetails)' \
+              --output json \
+              > /dev/null
+
+            echo "PASS: ECR access to $REPOSITORY"
+          done
+
+          echo "PASS: AWS authentication context validated."
+
+  # =======================================================
+  # JOB 2 — STAGING AUTHENTICATION
+  # =======================================================
+
+  staging-oidc:
+    name: Staging OIDC Authentication
+
+    needs: publisher-oidc
+    if: github.ref == 'refs/heads/main'
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    environment: staging
+
+    permissions:
+      id-token: write
+
+    env:
+      EXPECTED_CONTEXT: environment:staging
+      EXPECTED_ENVIRONMENT: staging
+      EXPECTED_ROLE: GitHubActions-ECR-Deployer
+      SESSION_NAME: oidc-staging-${{ github.run_id }}
+
+    steps:
+
+      # Reuse the publisher's diagnostic implementation,
+      # but with staging-specific environment variables.
+      - *validate-claims
+
+      - name: Obtain temporary staging credentials
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ECR_DEPLOYER_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: ${{ env.SESSION_NAME }}
+          role-duration-seconds: 900
+          allowed-account-ids: ${{ vars.AWS_ACCOUNT_ID }}
+
+      - *verify-aws
+
+  # =======================================================
+  # JOB 3 — PRODUCTION AUTHENTICATION
+  # =======================================================
+
+  production-oidc:
+    name: Production OIDC Authentication
+
+    needs: staging-oidc
+    if: github.ref == 'refs/heads/main'
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    # GitHub environment protection rules must be
+    # satisfied before this job can execute.
+    environment: production
+
+    permissions:
+      id-token: write
+
+    env:
+      EXPECTED_CONTEXT: environment:production
+      EXPECTED_ENVIRONMENT: production
+      EXPECTED_ROLE: GitHubActions-ECR-Deployer
+      SESSION_NAME: oidc-production-${{ github.run_id }}
+
+    steps:
+
+      - *validate-claims
+
+      - name: Obtain temporary production credentials
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ECR_DEPLOYER_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: ${{ env.SESSION_NAME }}
+          role-duration-seconds: 900
+          allowed-account-ids: ${{ vars.AWS_ACCOUNT_ID }}
+
+      - *verify-aws
+
+      - name: Confirm complete OIDC validation
+        shell: bash
+        run: |
+          echo "PASS: All three OIDC contexts validated."
