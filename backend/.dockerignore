@@ -1,21 +1,52 @@
+# =========================================================
+# Backend Docker build context exclusions
+# =========================================================
 
-.venv/
-venv/
-__pycache__/
-*.pyc
-.pytest_cache/
-.ruff_cache/
-.git/
-.env
-.env.*
+# Python virtual environments.
+**/.venv/
+**/venv/
+
+# Python bytecode and interpreter caches.
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+
+# Development and testing artifacts.
+**/.pytest_cache/
+**/.ruff_cache/
+**/.mypy_cache/
+**/.coverage
+**/.coverage.*
+**/htmlcov/
+**/coverage.xml
 tests/
+requirements-dev.txt
 
+# Environment variables and local credentials.
+**/.env
+**/.env.*
+**/.aws/
+**/.ssh/
+**/credentials
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
 
-# Exclude temporary development backups.
-*.backup
-*.bak
+# Temporary backups and archives.
+**/*.backup
+**/*.bak
+**/*.swp
+**/*.tmp
+**/*.log
+**/*.zip
+**/*.tar
+**/*.tar.gz
 
-# Exclude test coverage artifacts.
-.coverage
-.coverage.*
-htmlcov/
+# Version control and editor configuration.
+**/.git/
+**/.vscode/
+**/.idea/
+**/.DS_Store
+**/Thumbs.db

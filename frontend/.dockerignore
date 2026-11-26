@@ -1,6 +1,40 @@
-node_modules/
-dist/
-coverage/
-.git/
-.env
-.env.*
+# =========================================================
+# Frontend Docker build context exclusions
+# =========================================================
+
+# Dependencies installed inside the Docker build stage.
+**/node_modules/
+
+# Locally generated production assets and caches.
+**/dist/
+**/coverage/
+**/.vite/
+**/.cache/
+
+# Environment variables and local credentials.
+**/.env
+**/.env.*
+**/.aws/
+**/.ssh/
+**/credentials
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+
+# Temporary backups and archives.
+**/*.backup
+**/*.bak
+**/*.swp
+**/*.tmp
+**/*.log
+**/*.zip
+**/*.tar
+**/*.tar.gz
+
+# Version control and editor configuration.
+**/.git/
+**/.vscode/
+**/.idea/
+**/.DS_Store
+**/Thumbs.db
