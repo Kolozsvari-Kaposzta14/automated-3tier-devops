@@ -1,0 +1,139 @@
+# Reusable deployment configuration.
+#
+# Staging and production use different Compose project names,
+# environment files, HTTP ports, networks and database volumes.
+#
+# Application images are supplied by the trusted deployment script.
+# They must reference verified immutable ECR image digests.
+#
+# No application images are built locally by this configuration.
+
+services:
+
+  # --------------------------------------------------------
+  # Database tier
+  # --------------------------------------------------------
+  db:
+    image: postgres:16-alpine
+
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Database name required}
+      POSTGRES_USER: ${POSTGRES_USER:?Database user required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Database password required}
+
+    # Compose automatically prefixes this volume with
+    # the environment-specific project name.
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    # PostgreSQL is accessible only through the Compose network.
+    # No database port is published to the host.
+    networks:
+      - app_network
+
+    # Wait until PostgreSQL accepts connections.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+    security_opt:
+      - no-new-privileges:true
+
+  # --------------------------------------------------------
+  # Backend tier
+  # --------------------------------------------------------
+  backend:
+    image: ${BACKEND_IMAGE:?Verified backend image required}
+
+    restart: unless-stopped
+
+    environment:
+      DATABASE_URL: "postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}"
+
+    # Start FastAPI only after PostgreSQL is healthy.
+    depends_on:
+      db:
+        condition: service_healthy
+
+    expose:
+      - "8000"
+
+    networks:
+      - app_network
+
+    # The existing backend image already runs as appuser.
+    # Prevent privilege escalation and remove Linux capabilities.
+    security_opt:
+      - no-new-privileges:true
+
+    cap_drop:
+      - ALL
+
+    # Prevent modification of the backend container filesystem.
+    read_only: true
+
+    # Provide temporary writable storage when required.
+    tmpfs:
+      - /tmp
+
+  # --------------------------------------------------------
+  # Frontend tier
+  # --------------------------------------------------------
+  frontend:
+    image: ${FRONTEND_IMAGE:?Verified frontend image required}
+
+    restart: unless-stopped
+
+    expose:
+      - "80"
+
+    networks:
+      - app_network
+
+    security_opt:
+      - no-new-privileges:true
+
+  # --------------------------------------------------------
+  # Reverse proxy
+  # --------------------------------------------------------
+  nginx:
+    image: ${NGINX_IMAGE:?Verified Nginx image required}
+
+    restart: unless-stopped
+
+    depends_on:
+      backend:
+        condition: service_started
+      frontend:
+        condition: service_started
+
+    # Bind only to localhost.
+    # Staging uses 8082 and production uses 8081.
+    ports:
+      - "127.0.0.1:${HTTP_PORT:?HTTP port required}:80"
+
+    networks:
+      - app_network
+
+    security_opt:
+      - no-new-privileges:true
+
+# ----------------------------------------------------------
+# Environment-specific persistent storage
+# ----------------------------------------------------------
+volumes:
+  postgres_data:
+
+# ----------------------------------------------------------
+# Environment-specific application network
+# ----------------------------------------------------------
+networks:
+  app_network:
+    driver: bridge
