@@ -408,7 +408,7 @@ def verify_run_metadata(
 
     require(
         run["workflow_id"] == workflow["id"]
-        and run["name"] == WORKFLOW_NAME
+        and run["name"] == expected_title
         and run["path"] == WORKFLOW_PATH,
         "Authorization workflow identity mismatch",
     )
