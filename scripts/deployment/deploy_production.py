@@ -19,7 +19,7 @@ PG = 'postgres@sha256:f2f98726820d0342055351c6e9d36e705f5bfffb3dd53ff556325114b0
 PG_ID = 'sha256:' + PG.split(':')[1]
 PINS = {
     'deploy_release.py': '1a3d37584a555a3864732a4ca5ecce039f7834001d560863aa6cf9ce16db311a',
-    'verify_production_approval.py': 'c3655075db95305c415d7f56d3640f7f8d70f16794284bbcb04dc4464f487d4b',
+    'verify_production_approval.py': 'fe6311ba9589f7aac2cee89865e562a3d1111f3d42510d054a29149d0a450b70',
     'validate_release.py': '43c27775b9a9b4b20c6d4036c8f3af1122f258f10a32b4c22e4dfcb7a493029f',
 }
 
@@ -179,6 +179,6 @@ if __name__ == '__main__':
         main()
     except Exception as error:
         print('FAIL: Production controller stopped (' + type(error).__name__ + ')', file=sys.stderr)
-        if isinstance(error, RuntimeError):
+        if isinstance(error, RuntimeError) or type(error).__name__ == 'VerificationError':
             print(str(error), file=sys.stderr)
         sys.exit(1)
